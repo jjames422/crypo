@@ -23,15 +23,6 @@ async function getCryptoNetworkAndCryptoId(cryptoName, network) {
   return result;
 }
 
-// Function to encrypt the private key
-function encryptPrivateKey(privateKey) {
-  const iv = crypto.randomBytes(16);
-  const cipher = crypto.createCipheriv('aes-256-cbc', Buffer.from(process.env.ENCRYPTION_KEY), iv);
-  let encrypted = cipher.update(privateKey);
-  encrypted = Buffer.concat([encrypted, cipher.final()]);
-  return iv.toString('hex') + ':' + encrypted.toString('hex');
-}
-
 // Function to validate Bitcoin address
 function isValidBitcoinAddress(address) {
   try {
@@ -55,8 +46,18 @@ async function createBitcoinWallet(userId, cryptoNetworkId, cryptoId) {
   // Create the wallet in Bitcoin Core
   await bitcoinClient.command('createwallet', walletName);
 
+  // Use the wallet-specific RPC path for further commands
+  const walletClient = new BitcoinCore({
+    network: 'mainnet',
+    username: process.env.BITCOIN_RPC_USER,
+    password: process.env.BITCOIN_RPC_PASSWORD,
+    host: '127.0.0.1',
+    port: 8332,
+    wallet: walletName // Specify the wallet RPC path
+  });
+
   // Get a new Bitcoin address from the wallet
-  const address = await bitcoinClient.command('getnewaddress', '', 'bech32');
+  const address = await walletClient.command('getnewaddress', '', 'bech32');
 
   // Validate the Bitcoin address
   if (!isValidBitcoinAddress(address)) {
@@ -68,16 +69,6 @@ async function createBitcoinWallet(userId, cryptoNetworkId, cryptoId) {
     `INSERT INTO wallets (user_id, crypto_network_id, crypto_id, address, balance)
      VALUES ($1, $2, $3, $4, $5) RETURNING id`,
     [userId, cryptoNetworkId, cryptoId, address, 0]
-  );
-
-  // Encrypt the private key and store it securely (example placeholder)
-  const encryptedKey = encryptPrivateKey(wallet.privateKey);
-
-  // Store address and encrypted key if needed
-  await db.none(
-    `INSERT INTO addresses (wallet_id, address, private_key)
-     VALUES ($1, $2, $3)`,
-    [walletId.id, address, encryptedKey]
   );
 
   return address;
