@@ -1,62 +1,109 @@
-// app/api/swift/process/route.js
 import { NextResponse } from 'next/server';
 import fs from 'fs';
 import path from 'path';
-import db from '@/app/db';
+import formidable from 'formidable';
+import { Document, Packer, Paragraph, TextRun } from 'docx';
+import db from '@/app/db'; // Ensure this is the correct path for your database connection
+
+const uploadDir = path.join(process.cwd(), 'uploads');
+
+// Ensure the upload directory exists
+if (!fs.existsSync(uploadDir)) {
+  fs.mkdirSync(uploadDir, { recursive: true });
+}
 
 export async function POST(req) {
   try {
-    const { fileName, userId } = await req.json();
-    const filePath = path.join(process.cwd(), 'uploads', fileName);
+    const form = new formidable.IncomingForm();
+    form.uploadDir = uploadDir;
+    form.keepExtensions = true;
 
-    if (!fs.existsSync(filePath)) {
-      return NextResponse.json({ success: false, message: 'File not found' });
-    }
+    return new Promise((resolve, reject) => {
+      form.parse(req, async (err, fields, files) => {
+        if (err) {
+          console.error('File upload error:', err);
+          resolve(NextResponse.json({ success: false, message: 'An error occurred while uploading the file.' }, { status: 500 }));
+        }
 
-    // Example: Parse the SWIFT file and extract data (adjust according to your file format)
-    const fileContent = fs.readFileSync(filePath, 'utf-8');
-    const parsedData = parseSwiftFile(fileContent);
+        const file = files.file;
+        const filePath = path.join(uploadDir, file.newFilename);
 
-    // Check if the transaction already exists in the system
-    const existingTransaction = await db.oneOrNone(
-      'SELECT id FROM swift_transfers WHERE trn = $1',
-      [parsedData.trn]
-    );
+        // Rename and move the uploaded file to the desired location
+        fs.renameSync(file.filepath, filePath);
 
-    if (existingTransaction) {
-      return NextResponse.json({ success: false, message: 'Transaction already exists' });
-    }
+        // Read the DOCX file content
+        const fileContent = fs.readFileSync(filePath);
+        const paragraphs = getParagraphsFromDocx(fileContent);
+        let swiftData = {};
 
-    // Insert the SWIFT transaction data into the database
-    await db.none(
-      `INSERT INTO swift_transfers (user_id, trn, message_type, amount, currency, sender_name, beneficiary_name, date)
-       VALUES ($1, $2, $3, $4, $5, $6, $7, $8)`,
-      [userId, parsedData.trn, parsedData.messageType, parsedData.amount, parsedData.currency, parsedData.senderName, parsedData.beneficiaryName, parsedData.date]
-    );
+        paragraphs.forEach(paragraph => {
+          const text = paragraph.trim();
+          // Implement dynamic parsing logic
+          if (text.match(/Transaction Reference Number/i)) {
+            swiftData.trn = text.split(':').pop().trim();
+          } else if (text.match(/Amount/i)) {
+            swiftData.amount = text.split(':').pop().trim().replace(/[^\d.-]/g, ''); // Extract numeric value
+          } else if (text.match(/Currency/i)) {
+            swiftData.currency = text.split(':').pop().trim();
+          } else if (text.match(/Sender Name/i)) {
+            swiftData.sender_name = text.split(':').pop().trim();
+          } else if (text.match(/Beneficiary Name/i)) {
+            swiftData.beneficiary_name = text.split(':').pop().trim();
+          } else if (text.match(/Date/i)) {
+            swiftData.date = text.split(':').pop().trim();
+          }
+        });
 
-    // Update the user's fiat balance
-    await db.none(
-      `UPDATE cash_balances SET balance = balance + $1 WHERE user_id = $2 AND currency = $3`,
-      [parsedData.amount, userId, 'USD']
-    );
+        // Validate required fields
+        const requiredFields = ['trn', 'amount', 'currency', 'sender_name', 'beneficiary_name', 'date'];
+        for (const field of requiredFields) {
+          if (!swiftData[field]) {
+            return resolve(NextResponse.json({ success: false, message: `${field} is missing in the uploaded file.` }, { status: 400 }));
+          }
+        }
 
-    return NextResponse.json({ success: true, message: 'SWIFT file processed and balance updated' });
+        // Get user ID from the beneficiary name
+        const userId = await getUserIdFromBeneficiary(swiftData.beneficiary_name);
+        if (!userId) {
+          return resolve(NextResponse.json({ success: false, message: 'Beneficiary not found in the database.' }, { status: 404 }));
+        }
+
+        // Insert parsed data into the database
+        await db.none(
+          `INSERT INTO swift_transfers 
+            (user_id, trn, message_type, amount, currency, sender_name, beneficiary_name, date, created_at, updated_at) 
+           VALUES 
+            ($1, $2, $3, $4, $5, $6, $7, $8, NOW(), NOW())`,
+          [userId, swiftData.trn, 'MT103', swiftData.amount, swiftData.currency, swiftData.sender_name, swiftData.beneficiary_name, swiftData.date]
+        );
+
+        resolve(NextResponse.json({
+          success: true,
+          message: 'File uploaded and parsed successfully.',
+          data: swiftData
+        }, { status: 200 }));
+      });
+    });
+
   } catch (error) {
-    console.error('Error processing SWIFT file:', error);
-    return NextResponse.json({ success: false, message: 'An error occurred while processing the SWIFT file' });
+    console.error('Error handling file upload:', error);
+    return NextResponse.json({ success: false, message: 'An error occurred while processing the file.' }, { status: 500 });
   }
 }
 
-// Example function to parse a SWIFT file (adjust according to your file format)
-function parseSwiftFile(fileContent) {
-  // Implement your file parsing logic here
-  return {
-    trn: '1234567890',
-    messageType: '103',
-    amount: 1000,
-    currency: 'USD',
-    senderName: 'Sender Name',
-    beneficiaryName: 'Beneficiary Name',
-    date: new Date(),
-  };
+// Helper function to extract paragraphs from DOCX file
+function getParagraphsFromDocx(fileContent) {
+  // Implement the logic to read and parse DOCX content into paragraphs
+  // Use a library like 'docx' or 'mammoth' to handle DOCX parsing
+  // This is a placeholder function and needs to be implemented based on your requirements
+  return []; // Return an array of paragraphs
+}
+
+// Helper function to get user_id based on the beneficiary name
+async function getUserIdFromBeneficiary(beneficiaryName) {
+  const result = await db.oneOrNone(
+    'SELECT id FROM users WHERE beneficiary_name = $1',
+    [beneficiaryName]
+  );
+  return result ? result.id : null;
 }
