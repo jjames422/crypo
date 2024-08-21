@@ -1,109 +1,163 @@
 import { NextResponse } from 'next/server';
 import fs from 'fs';
 import path from 'path';
-import formidable from 'formidable';
-import { Document, Packer, Paragraph, TextRun } from 'docx';
-import db from '@/app/db'; // Ensure this is the correct path for your database connection
+import mammoth from 'mammoth';
+import db from '@/app/db';
 
-const uploadDir = path.join(process.cwd(), 'uploads');
+const uploadsDir = path.join(process.cwd(), 'uploads', 'swift');
 
-// Ensure the upload directory exists
-if (!fs.existsSync(uploadDir)) {
-  fs.mkdirSync(uploadDir, { recursive: true });
-}
+// Hard-coded exchange rates (Example: 1 EUR = 1.1 USD)
+const exchangeRates = {
+  EUR: 1.1,
+  GBP: 1.25,
+  // Add more currencies as needed
+};
 
 export async function POST(req) {
   try {
-    const form = new formidable.IncomingForm();
-    form.uploadDir = uploadDir;
-    form.keepExtensions = true;
+    const { fileId, userId } = await req.json();
 
-    return new Promise((resolve, reject) => {
-      form.parse(req, async (err, fields, files) => {
-        if (err) {
-          console.error('File upload error:', err);
-          resolve(NextResponse.json({ success: false, message: 'An error occurred while uploading the file.' }, { status: 500 }));
-        }
+    if (!fileId || !userId) {
+      return NextResponse.json({ success: false, message: 'fileId and userId are required.' }, { status: 400 });
+    }
 
-        const file = files.file;
-        const filePath = path.join(uploadDir, file.newFilename);
+    const filePath = path.join(uploadsDir, fileId);
 
-        // Rename and move the uploaded file to the desired location
-        fs.renameSync(file.filepath, filePath);
+    if (!fs.existsSync(filePath)) {
+      return NextResponse.json({ success: false, message: 'File not found' }, { status: 404 });
+    }
 
-        // Read the DOCX file content
-        const fileContent = fs.readFileSync(filePath);
-        const paragraphs = getParagraphsFromDocx(fileContent);
-        let swiftData = {};
+    // Read the DOCX file content
+    const paragraphs = await getParagraphsFromDocx(filePath);
+    let swiftData = {};
 
-        paragraphs.forEach(paragraph => {
-          const text = paragraph.trim();
-          // Implement dynamic parsing logic
-          if (text.match(/Transaction Reference Number/i)) {
-            swiftData.trn = text.split(':').pop().trim();
-          } else if (text.match(/Amount/i)) {
-            swiftData.amount = text.split(':').pop().trim().replace(/[^\d.-]/g, ''); // Extract numeric value
-          } else if (text.match(/Currency/i)) {
-            swiftData.currency = text.split(':').pop().trim();
-          } else if (text.match(/Sender Name/i)) {
-            swiftData.sender_name = text.split(':').pop().trim();
-          } else if (text.match(/Beneficiary Name/i)) {
-            swiftData.beneficiary_name = text.split(':').pop().trim();
-          } else if (text.match(/Date/i)) {
-            swiftData.date = text.split(':').pop().trim();
-          }
-        });
-
-        // Validate required fields
-        const requiredFields = ['trn', 'amount', 'currency', 'sender_name', 'beneficiary_name', 'date'];
-        for (const field of requiredFields) {
-          if (!swiftData[field]) {
-            return resolve(NextResponse.json({ success: false, message: `${field} is missing in the uploaded file.` }, { status: 400 }));
-          }
-        }
-
-        // Get user ID from the beneficiary name
-        const userId = await getUserIdFromBeneficiary(swiftData.beneficiary_name);
-        if (!userId) {
-          return resolve(NextResponse.json({ success: false, message: 'Beneficiary not found in the database.' }, { status: 404 }));
-        }
-
-        // Insert parsed data into the database
-        await db.none(
-          `INSERT INTO swift_transfers 
-            (user_id, trn, message_type, amount, currency, sender_name, beneficiary_name, date, created_at, updated_at) 
-           VALUES 
-            ($1, $2, $3, $4, $5, $6, $7, $8, NOW(), NOW())`,
-          [userId, swiftData.trn, 'MT103', swiftData.amount, swiftData.currency, swiftData.sender_name, swiftData.beneficiary_name, swiftData.date]
-        );
-
-        resolve(NextResponse.json({
-          success: true,
-          message: 'File uploaded and parsed successfully.',
-          data: swiftData
-        }, { status: 200 }));
-      });
+    paragraphs.forEach(paragraph => {
+      const text = paragraph.trim();
+      // Updated dynamic parsing logic
+      if (text.match(/TRN:/i)) {
+        swiftData.trn = text.split(':').pop().trim();
+      } else if (text.match(/Amount:/i)) {
+        swiftData.amount = parseFloat(text.split(':').pop().trim().replace(/[^\d.-]/g, '')); // Extract numeric value
+      } else if (text.match(/Currency:/i)) {
+        swiftData.currency = text.split(':').pop().trim();
+      } else if (text.match(/Sender Name:/i)) {
+        swiftData.sender_name = text.split(':').pop().trim();
+      } else if (text.match(/Beneficiary Name:/i)) {
+        swiftData.beneficiary_name = text.split(':').pop().trim();
+      } else if (matchDate(text)) {
+        swiftData.date = matchDate(text);
+      }
     });
 
+    // Validate required fields
+    const requiredFields = ['trn', 'amount', 'currency', 'sender_name', 'beneficiary_name', 'date'];
+    for (const field of requiredFields) {
+      if (!swiftData[field]) {
+        return NextResponse.json({ success: false, message: `${field} is missing in the uploaded file.` }, { status: 400 });
+      }
+    }
+
+    // Currency conversion to USD
+    if (swiftData.currency !== 'USD') {
+      console.log(`Converting ${swiftData.amount} ${swiftData.currency} to USD.`);
+      const conversionRate = exchangeRates[swiftData.currency];
+      if (!conversionRate) {
+        return NextResponse.json({ success: false, message: `Conversion rate for ${swiftData.currency} is not available.` }, { status: 400 });
+      }
+      swiftData.amount = swiftData.amount * conversionRate;
+      swiftData.currency = 'USD';
+      console.log(`Conversion successful: ${swiftData.amount} USD.`);
+    }
+
+    // Convert the date format to YYYY-MM-DD
+    swiftData.date = convertDateFormat(swiftData.date);
+
+    // Insert parsed data into the swift_transfers table
+    await db.none(
+      `INSERT INTO swift_transfers 
+        (user_id, trn, message_type, amount, currency, sender_name, beneficiary_name, date, created_at, updated_at) 
+       VALUES 
+        ($1, $2, $3, $4, $5, $6, $7, $8, NOW(), NOW())`,
+      [userId, swiftData.trn, 'MT103', swiftData.amount, swiftData.currency, swiftData.sender_name, swiftData.beneficiary_name, swiftData.date]
+    );
+
+    // Insert or update the user's cash balance
+    const existingBalance = await db.oneOrNone(
+      `SELECT balance FROM cash_balances WHERE user_id = $1`,
+      [userId]
+    );
+
+    if (existingBalance) {
+      // Update the existing balance
+      await db.none(
+        `UPDATE cash_balances 
+         SET balance = balance + $1, updated_at = NOW() 
+         WHERE user_id = $2`,
+        [swiftData.amount, userId]
+      );
+      console.log(`Updated cash balance for user ${userId} by ${swiftData.amount} USD.`);
+    } else {
+      // Insert a new balance record
+      await db.none(
+        `INSERT INTO cash_balances (user_id, currency, balance, created_at, updated_at) 
+         VALUES ($1, 'USD', $2, NOW(), NOW())`,
+        [userId, swiftData.amount]
+      );
+      console.log(`Created new cash balance record for user ${userId} with ${swiftData.amount} USD.`);
+    }
+
+    return NextResponse.json({
+      success: true,
+      message: 'File processed and data inserted successfully.',
+      data: swiftData
+    }, { status: 200 });
+
   } catch (error) {
-    console.error('Error handling file upload:', error);
+    console.error('Error processing file:', error);
     return NextResponse.json({ success: false, message: 'An error occurred while processing the file.' }, { status: 500 });
   }
 }
 
 // Helper function to extract paragraphs from DOCX file
-function getParagraphsFromDocx(fileContent) {
-  // Implement the logic to read and parse DOCX content into paragraphs
-  // Use a library like 'docx' or 'mammoth' to handle DOCX parsing
-  // This is a placeholder function and needs to be implemented based on your requirements
-  return []; // Return an array of paragraphs
+async function getParagraphsFromDocx(filePath) {
+  try {
+    const result = await mammoth.extractRawText({ path: filePath });
+    return result.value.split('\n').filter(paragraph => paragraph.trim() !== ''); // Splitting text into paragraphs
+  } catch (error) {
+    console.error('Error parsing DOCX file:', error);
+    return [];
+  }
 }
 
-// Helper function to get user_id based on the beneficiary name
-async function getUserIdFromBeneficiary(beneficiaryName) {
-  const result = await db.oneOrNone(
-    'SELECT id FROM users WHERE beneficiary_name = $1',
-    [beneficiaryName]
-  );
-  return result ? result.id : null;
+// Helper function to match various date formats
+function matchDate(text) {
+  const datePatterns = [
+    /\b\d{2}\/\d{2}\/\d{4}\b/, // Matches DD/MM/YYYY or MM/DD/YYYY
+    /\b\d{4}\/\d{2}\/\d{2}\b/, // Matches YYYY/MM/DD
+    /\b\d{2}-\d{2}-\d{4}\b/,   // Matches DD-MM-YYYY
+    /\b[A-Za-z]+\s\d{1,2},\s\d{4}\b/ // Matches Month Day, Year
+  ];
+
+  for (const pattern of datePatterns) {
+    const match = text.match(pattern);
+    if (match) {
+      return match[0];
+    }
+  }
+  return null;
+}
+
+// Helper function to convert date format to YYYY-MM-DD
+function convertDateFormat(dateString) {
+  // Handle various date formats
+  if (dateString.includes('/')) {
+    // Assuming dateString is in DD/MM/YYYY format
+    const [day, month, year] = dateString.split('/');
+    return `${year}-${month}-${day}`;
+  } else if (dateString.includes('-')) {
+    // Assuming dateString is in DD-MM-YYYY format
+    const [day, month, year] = dateString.split('-');
+    return `${year}-${month}-${day}`;
+  }
+  return dateString; // If it's already in YYYY-MM-DD format
 }
