@@ -1,0 +1,2 @@
+74302aede4747b06495213ac7c96ddbc8535e58c 102128 bcrypt_lib.node
+ebe8feab5bf5db5ccee6750e27dd3264e1b2da9f 131357024 next-swc.linux-x64-gnu.node
